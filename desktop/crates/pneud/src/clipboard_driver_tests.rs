@@ -87,6 +87,7 @@ async fn scenario(mode: u8) -> Result<()> {
     };
     let (reply, _) = oneshot::channel();
     let request = Request {
+        sms: false,
         input: ClipboardInput::Text("remote".into()),
         claim: None,
         store: core.store.clone(),
@@ -263,6 +264,7 @@ async fn queued_request_during_persistent_clock_failure_times_out_and_shutdown_d
     };
     let (reply, _) = oneshot::channel();
     let request = Request {
+        sms: false,
         input: ClipboardInput::Text("queued remote".into()),
         claim: None,
         store: core.store.clone(),
@@ -372,6 +374,7 @@ async fn retired_marker_scenario(legacy: bool) -> Result<()> {
                     observation: None,
                 },
                 Request {
+                    sms: false,
                     input: ClipboardInput::Text(value.into()),
                     claim: None,
                     store: core.store.clone(),
@@ -416,6 +419,7 @@ fn input_content(input: &ClipboardInput) -> Result<Content> {
         ClipboardInput::Files(files) => {
             Content::Text(String::from_utf8(crate::actions::file_uri_list(files)?)?)
         }
+        ClipboardInput::SecretText(text) => Content::Text(text.0.clone()),
         ClipboardInput::Text(text) => Content::Text(text.clone()),
         ClipboardInput::Image(file, _) => Content::Image(file.read_bounded(16 * 1024 * 1024)?),
         ClipboardInput::Bytes { bytes, .. } => Content::Image(bytes.clone()),
@@ -532,6 +536,7 @@ async fn submit_payload(core: &Arc<Core>, content: &Content) -> Result<Outcome> 
         core.clipboard.submit(
             operation,
             Request {
+                sms: false,
                 input,
                 claim: None,
                 store: core.store.clone(),
@@ -627,6 +632,7 @@ async fn cached_file_winner_repair_reoffers_identical_named_uris() -> Result<()>
                     observation: None,
                 },
                 Request {
+                    sms: false,
                     input,
                     claim: None,
                     store: core.store.clone(),
@@ -774,6 +780,7 @@ async fn watcher_clock_and_all_sixteen_real_claims_complete_before_request_deadl
             let operation = receive_operation(handle.token(), &text);
             let (reply, rx) = oneshot::channel();
             let request = Request {
+                sms: false,
                 input: ClipboardInput::Text(text.text),
                 claim: Some(claim),
                 store: core.store.clone(),
@@ -844,6 +851,7 @@ async fn transient_watcher_clock_failure_recovers_without_another_observation() 
     };
     let (reply, _) = oneshot::channel();
     let request = Request {
+        sms: false,
         input: ClipboardInput::Text(text.text.clone()),
         claim: None,
         store: core.store.clone(),
@@ -899,6 +907,7 @@ async fn lost_read_completion_expires_and_releases_the_actor_without_user_activi
     };
     let (reply, _) = oneshot::channel();
     let request = Request {
+        sms: false,
         input: ClipboardInput::Text(text.text.clone()),
         claim: None,
         store: core.store.clone(),

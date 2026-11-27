@@ -20,6 +20,7 @@ pub(in crate::core) struct Outcome {
 }
 pub(in crate::core) struct Request {
     pub input: ClipboardInput,
+    pub sms: bool,
     pub claim: Option<ClipboardReservation>,
     pub store: Store,
     pub authority: Option<(ActionScope, ActionOrigin)>,
@@ -35,6 +36,8 @@ pub(in crate::core) enum Message {
         tokio::sync::OwnedSemaphorePermit,
     ),
     InstallMarker(Ticket, oneshot::Sender<bool>),
+    #[cfg(target_os = "linux")]
+    Register(oneshot::Sender<Option<Key>>),
     Submit(Operation, Box<Request>, tokio::sync::OwnedSemaphorePermit),
     ReadHandle(Token, Arc<std::sync::atomic::AtomicBool>),
     #[cfg(test)]
@@ -60,6 +63,14 @@ impl Handle {
             },
             rx,
         )
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn register(&self) -> Result<Option<Key>> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Message::Register(tx))
+            .map_err(|_| anyhow!("clipboard actor stopped"))?;
+        rx.await.map_err(|_| anyhow!("clipboard actor stopped"))
     }
     pub fn token(&self) -> Token {
         self.sequence.fetch_add(1, Ordering::Relaxed)
@@ -198,24 +209,36 @@ impl Driver {
         self.requests.get(&operation.token).is_none_or(|request| {
             request.authority.as_ref().is_none_or(|(scope, origin)| {
                 scope.allows(origin)
-                    && (!origin.mesh || {
-                        request.policy
-                            == core.clipboard_receive_policy(&origin.device, request.kind)
+                    && if request.sms {
+                        request.policy == core.sms_receive_policy(&origin.device)
                             && core.pair_allows(
                                 &origin.device,
                                 &origin.device,
                                 &core.identity.device_id,
-                                "clipboard",
+                                "sms",
                             )
-                            && match &request.input {
-                                ClipboardInput::Text(_) => true,
-                                _ => core.incoming_kind_allowed(
-                                    &request.store,
+                    } else {
+                        !origin.mesh || {
+                            request.policy
+                                == core.clipboard_receive_policy(&origin.device, request.kind)
+                                && core.pair_allows(
                                     &origin.device,
-                                    request.kind.unwrap_or(pneu_proto::FileKind::ClipboardImage),
-                                ),
-                            }
-                    })
+                                    &origin.device,
+                                    &core.identity.device_id,
+                                    "clipboard",
+                                )
+                                && match &request.input {
+                                    ClipboardInput::Text(_) => true,
+                                    _ => core.incoming_kind_allowed(
+                                        &request.store,
+                                        &origin.device,
+                                        request
+                                            .kind
+                                            .unwrap_or(pneu_proto::FileKind::ClipboardImage),
+                                    ),
+                                }
+                        }
+                    }
             })
         })
     }
@@ -243,6 +266,9 @@ impl Driver {
                             let content = outbox
                                 .file_io(move || {
                                     Ok(match payload.as_ref() {
+                                        Payload::Input(ClipboardInput::SecretText(_)) => {
+                                            anyhow::bail!("sensitive clipboard cannot be shared")
+                                        }
                                         Payload::Content(content) => content.clone(),
                                         #[cfg(target_os = "linux")]
                                         Payload::Input(ClipboardInput::Files(_)) => {
@@ -397,6 +423,7 @@ impl Driver {
                             origin,
                             policy: r.policy.clone(),
                             kind: r.kind,
+                            sms: r.sms,
                             store: r.store.clone(),
                             input: r.input.clone(),
                             core: self.core.clone(),
@@ -404,6 +431,9 @@ impl Driver {
                     });
                     let fingerprint_key = self.state.fingerprint_key.clone();
                     let token = operation.token;
+                    let secret = operation.secret();
+                    let automatic_secret = matches!(&input,ClipboardInput::SecretText(t) if t.1);
+                    let received_at = operation.created_at;
                     let (stop, mut stopped) = watch::channel(false);
                     let (authorize, authorized) = oneshot::channel();
                     self.helpers.insert(
@@ -418,6 +448,11 @@ impl Driver {
                         async move {
                             #[cfg(windows)]
                             let install_authority = authority.clone();
+                            let installed_authority = authority.clone().map(|mut authority| {
+                                // Once installed, a code belongs to the pairing, not its transport.
+                                authority.origin.connection_id = None;
+                                authority
+                            });
                             let revoked = async move {
                                 if let Some(mut authority) = authority {
                                     authority.revoked().await;
@@ -464,7 +499,9 @@ impl Driver {
                                 _=&mut revoked=>{ handle.event(Event::Revoked(token)); false },
                                 result=authorized=>result.is_ok(),
                             };
-                            if commit {
+                            if commit && automatic_secret && (!crate::sms::fresh(received_at,crate::now_ms()) || actions.screen_locked().await) {
+                                handle.event(Event::Skip(ticket));
+                            } else if commit {
                                 #[cfg(windows)]
                                 {
                                     let stopped = stopped.clone();
@@ -485,17 +522,27 @@ impl Driver {
                                         if !needs_marker {
                                             handle.event(Event::Installed(ticket));
                                         }
+                                        let installed_revoked = async move {
+                                            if let Some(mut authority) = installed_authority {
+                                                authority.revoked().await;
+                                            } else {
+                                                std::future::pending::<()>().await;
+                                            }
+                                        };
+                                        tokio::pin!(installed_revoked);
                                         tokio::select! {biased;
+                                            _=async {if secret {tokio::time::sleep(std::time::Duration::from_secs(crate::sms::CLEAR_AFTER_SECS)).await;} else {std::future::pending::<()>().await;}}=>{handle.event(Event::SecretClearing(ticket));},
                                             _=stopped.changed()=>{},
-                                            _=&mut revoked=>{
+                                            _=async { if secret { installed_revoked.await } else { revoked.await } }=>{
                                                 // The marker may already have completed the op.
                                                 // Let the actor decide; confirmed receipts and the
                                                 // serving selection survive policy changes.
                                                 handle.event(Event::Revoked(token));
-                                                tokio::select! {biased;
+                                                if secret {handle.event(Event::SecretClearing(ticket));}
+                                                if !secret {tokio::select! {biased;
                                                     _=stopped.changed()=>{},
                                                     _=prepared.wait_exit()=>{},
-                                                }
+                                                }}
                                             },
                                             _=prepared.wait_exit()=>{},
                                         }
@@ -520,6 +567,18 @@ impl Driver {
                     ));
                 }
                 Effect::SaveHistory { ticket, history } => {
+                    if self
+                        .state
+                        .installing
+                        .as_ref()
+                        .is_some_and(|i| i.ticket == ticket && i.operation.secret())
+                    {
+                        self.send(Event::HistorySaved {
+                            ticket,
+                            success: true,
+                        });
+                        continue;
+                    }
                     let store = core.store.clone();
                     let handle = self.handle.clone();
                     self.history_revision += 1;
@@ -757,6 +816,8 @@ pub(in crate::core) async fn run(
                         let _=reply.send(current);
                         if current {Event::Installed(ticket)} else {continue;}
                     }
+                    #[cfg(target_os = "linux")]
+                    Message::Register(reply)=>{let _=reply.send(driver.state.register.clone());continue;}
                     Message::ReadHandle(token,cancel)=>{driver.reads.insert(token,cancel);continue;}
                     Message::Submit(mut operation,request,permit)=>{
                         operation.payload=Some(Arc::new(Payload::Input(request.input.clone())));
@@ -866,13 +927,14 @@ mod tests;
 
 /// Authority is watched independently from the event loop. A blocked install
 /// future is dropped on revocation before the helper is stopped and reaped.
-#[cfg_attr(windows, derive(Clone))]
+#[derive(Clone)]
 struct Authority {
     core: Weak<Core>,
     scope: ActionScope,
     origin: ActionOrigin,
     policy: Vec<pneu_proto::PeerSetting>,
     kind: Option<pneu_proto::FileKind>,
+    sms: bool,
     input: ClipboardInput,
     store: Store,
     cancelled: watch::Receiver<bool>,
@@ -884,21 +946,33 @@ impl Authority {
     fn valid(&self) -> bool {
         self.core.upgrade().is_some_and(|core| {
             self.scope.allows(&self.origin)
-                && (!self.origin.mesh || {
-                    self.policy == core.clipboard_receive_policy(&self.origin.device, self.kind)
+                && if self.sms {
+                    (!matches!(&self.input, ClipboardInput::SecretText(text) if text.1)
+                        || core.config().copy_sms_codes)
+                        && self.policy == core.sms_receive_policy(&self.origin.device)
                         && core.pair_allows(
                             &self.origin.device,
                             &self.origin.device,
                             &core.identity.device_id,
-                            "clipboard",
+                            "sms",
                         )
-                        && (matches!(self.input, ClipboardInput::Text(_))
-                            || core.incoming_kind_allowed(
-                                &self.store,
+                } else {
+                    !self.origin.mesh || {
+                        self.policy == core.clipboard_receive_policy(&self.origin.device, self.kind)
+                            && core.pair_allows(
                                 &self.origin.device,
-                                self.kind.unwrap_or(pneu_proto::FileKind::ClipboardImage),
-                            ))
-                })
+                                &self.origin.device,
+                                &core.identity.device_id,
+                                "clipboard",
+                            )
+                            && (matches!(self.input, ClipboardInput::Text(_))
+                                || core.incoming_kind_allowed(
+                                    &self.store,
+                                    &self.origin.device,
+                                    self.kind.unwrap_or(pneu_proto::FileKind::ClipboardImage),
+                                ))
+                    }
+                }
         })
     }
     async fn revoked(&mut self) {

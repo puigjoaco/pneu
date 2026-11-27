@@ -44,6 +44,8 @@ mod file_sender;
 pub mod mesh;
 #[path = "peer_settings.rs"]
 mod peer_settings;
+#[path = "core_sms.rs"]
+mod sms_receive;
 use file_sender::{FileWrite, transmit_file};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -344,6 +346,7 @@ impl ActionQueue {
     async fn begin_clipboard_file(
         &self,
         store: &Store,
+        clipboard: &clipboard_driver::Handle,
         scope: &ActionScope,
         origin: &ActionOrigin,
         metadata: &FileBegin,
@@ -378,7 +381,13 @@ impl ActionQueue {
             }
         } else if origin.mesh && metadata.kind != FileKind::ClipboardImage {
             store
-                .allocate_clipboard_clock(origin.device.clone(), None, |_| Ok(()))
+                // SMS codes advance only the actor's session register. Include
+                // it when reserving a later group's BEGIN clock.
+                .allocate_clipboard_clock(
+                    origin.device.clone(),
+                    clipboard.register().await?,
+                    |_| Ok(()),
+                )
                 .await?
         } else {
             clipboard_actor::Key {
@@ -1142,6 +1151,8 @@ pub struct Core {
     config_gate: Arc<tokio::sync::Mutex<()>>,
     clipboard: clipboard_driver::Handle,
     clipboard_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    sms: Mutex<crate::sms::State>,
+    sms_gate: tokio::sync::Mutex<()>,
     settings_gate: tokio::sync::Mutex<()>,
     settings_ready: Mutex<HashMap<Id, u64>>,
     next_connection: AtomicU64,
@@ -1303,6 +1314,8 @@ impl Core {
             sessions: Arc::new(Mutex::new(Connections::default())),
             clipboard,
             clipboard_worker: Mutex::new(None),
+            sms: Mutex::new(crate::sms::State::default()),
+            sms_gate: tokio::sync::Mutex::new(()),
             settings_gate: tokio::sync::Mutex::new(()),
             settings_ready: Mutex::new(HashMap::new()),
             next_connection: AtomicU64::new(1),
@@ -1527,6 +1540,21 @@ impl Core {
         let mut ui = self.ui.lock().expect("UI state");
         select_display(&sessions, &admission, &mut ui);
         let mut snapshot = ui.snapshot.clone();
+        let activated = self
+            .store
+            .sms_activated
+            .lock()
+            .expect("SMS activation")
+            .clone();
+        snapshot.sms_available = self
+            .store
+            .pair_settings
+            .lock()
+            .expect("pair settings")
+            .iter()
+            .any(|(id, fields)| {
+                activated.contains(id) && fields.iter().any(|f| f.key.ends_with("/sms"))
+            });
         snapshot.devices = self.device_snapshots(&sessions, &admission, &ui);
         snapshot.send_targets = self.file_targets(&snapshot.devices, &sessions, &admission);
         snapshot.transfers = self.outbox.snapshot(&snapshot.connected_devices);
@@ -1763,8 +1791,20 @@ impl Core {
             .get(&device)
             .cloned();
         self.clipboard.event(ClipboardEvent::Revoke(device.clone()));
-        if let Some(scope) = &scope {
-            scope.cancelled.send_replace(true);
+        {
+            let mut sms = self.sms.lock().expect("SMS");
+            if let Some(scope) = &scope {
+                scope.cancelled.send_replace(true);
+            }
+            sms.messages.retain(|(target, _)| target.device != device);
+            sms.bursts.remove(&device);
+            self.store
+                .sms_activated
+                .lock()
+                .expect("SMS activation")
+                .remove(&device);
+        }
+        if scope.is_some() {
             self.action_queue.discard_invalid();
         }
         let admission = self.admission.clone();
@@ -2007,6 +2047,9 @@ impl Core {
             "save_to_folder" => config.save_to_folder = serde_json::from_value(value)?,
             "save_path" => config.save_path = serde_json::from_value(value)?,
             "notification_preview" => config.notification_preview = serde_json::from_value(value)?,
+            "copy_sms_codes" => {
+                config.copy_sms_codes = serde_json::from_value(value)?;
+            }
             "copy_image_to_clipboard" => {
                 config.copy_image_to_clipboard = serde_json::from_value(value)?
             }
@@ -2524,6 +2567,7 @@ impl Core {
             .submit(
                 operation,
                 clipboard_driver::Request {
+                    sms: false,
                     input,
                     claim: None,
                     store: self.store.clone(),
@@ -3215,6 +3259,15 @@ impl Core {
             .as_ref()
             .map(|scope| scope.connection_generation.load(Ordering::SeqCst));
         store.mesh = hello.capabilities.iter().any(|c| c == "mesh");
+        store.negotiated_sms = action_scope.as_ref().map(|scope| {
+            (
+                store.mesh
+                    && hello.role == Some(DeviceRole::Phone)
+                    && hello.capabilities.iter().any(|c| c == "sms"),
+                scope.registration_generation.clone(),
+                connection_id,
+            )
+        });
         store.local_device = Some(self.identity.device_id.clone());
         let result = if persisted {
             // The task's total transport permit remains held through READY
@@ -3889,6 +3942,9 @@ impl Core {
                                 self.error(Some(hello.device_id.clone()),format!("clipboard delivery rejected: {:?}",nack.code));
                             },
                             m @ (Message::FileBegin(_)|Message::FileChunk(_)|Message::FileEnd(_))=>{if !enqueue(&file_tx,ApplicationMessage { message: m, refusal },&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
+                            m @ Message::Sms(_) if store.mesh && hello.role==Some(DeviceRole::Phone) && hello.capabilities.iter().any(|c|c=="sms") && settings_received=>{
+                                if !enqueue(&text_tx,m,&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}
+                            },
                             m @ Message::Clipboard(_)=>{if !enqueue(&text_tx,m,&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
                             _=>bail!("unexpected READY frame"),
                         }
@@ -4052,6 +4108,7 @@ impl Core {
                             .action_queue
                             .begin_clipboard_file(
                                 store,
+                                &self.clipboard,
                                 scope,
                                 &ActionOrigin::captured(store, device),
                                 &begin,
@@ -4455,6 +4512,10 @@ impl Core {
                     }
                     incoming.take();
                 }
+                Message::Sms(sms) => {
+                    self.receive_sms(store, device, sms, action_scope, tx)
+                        .await?;
+                }
                 Message::Clipboard(text) => {
                     let receipt = if store.mesh {
                         match store
@@ -4567,6 +4628,7 @@ impl Core {
                         .submit(
                             operation,
                             clipboard_driver::Request {
+                                sms: false,
                                 input: crate::actions::ClipboardInput::Text(text.text.clone()),
                                 claim: Some(claim),
                                 store: store.clone(),
@@ -4934,6 +4996,7 @@ impl Core {
                 .submit(
                     operation,
                     clipboard_driver::Request {
+                        sms: false,
                         input,
                         claim: None,
                         store,
@@ -6149,6 +6212,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[derive(Default)]
     struct ReceivedClipboardOffers {
+        secrets: Mutex<Vec<String>>,
         offers: Mutex<Vec<Vec<PathBuf>>>,
         opened: Mutex<Vec<PathBuf>>,
     }
@@ -6174,6 +6238,10 @@ mod tests {
         ) -> Result<()> {
             use crate::actions::ClipboardInput;
             let paths = match offer.input() {
+                ClipboardInput::SecretText(text) => {
+                    self.secrets.lock().unwrap().push(text.0.clone());
+                    return Ok(());
+                }
                 ClipboardInput::Files(files) => files.iter().map(|f| f.path().to_owned()).collect(),
                 ClipboardInput::Image(file, _) => vec![file.path().to_owned()],
                 _ => anyhow::bail!("unexpected offer"),
@@ -6183,13 +6251,129 @@ mod tests {
         }
     }
     #[cfg(target_os = "linux")]
-    async fn begin_received_job(store: &Store, queue: &ActionQueue, job: &mut ActionJob) {
+    async fn begin_received_job(core: &Core, queue: &ActionQueue, job: &mut ActionJob) {
         let (order, files) = queue
-            .begin_clipboard_file(store, &job.scope, &job.origin, &job.metadata)
+            .begin_clipboard_file(
+                &core.store,
+                &core.clipboard,
+                &job.scope,
+                &job.origin,
+                &job.metadata,
+            )
             .await
             .unwrap();
         job.clipboard_order = Some(order);
         job.clipboard_files = files;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn received_file_groups_and_sms_codes_keep_newest_clipboard_winner() -> Result<()> {
+        for complete_old_group in [false, true] {
+            let actions = Arc::new(ReceivedClipboardOffers::default());
+            let (dir, core, device) = fixture(actions.clone()).await?;
+            let _session = admit_ui_test_phone(&core, &device, 1)?;
+            let mut job = received_clipboard_job(dir.path())?;
+            job.scope = core.action_scope.lock().unwrap()[&device].clone();
+            job.origin.device = device.clone();
+            job.metadata.mime = "application/pdf".into();
+            job.metadata.hlc = None;
+            let queue = ActionQueue::default();
+            begin_received_job(&core, &queue, &mut job).await;
+            queue.push(job.clone());
+            let first = queue.pending.lock().unwrap().automatic.take().unwrap();
+            core.file_actions(&first, false, DesktopAction::Automatic)
+                .await;
+            assert_eq!(actions.offers.lock().unwrap().len(), 1);
+            assert!(
+                core.share_clipboard(crate::outbox::Targets::All("all".into()))
+                    .await
+                    .is_err()
+            );
+
+            // The second file already belongs to the old group when a newer code arrives.
+            job.metadata.transfer_id = Id::from_bytes([91; 16]);
+            begin_received_job(&core, &queue, &mut job).await;
+            let mut message = sms_message("OTP 482913");
+            message.received_at += 5_000;
+            let (tx, mut rx) = mpsc::channel(10);
+            core.receive_test(
+                &core.store,
+                &device,
+                Message::Sms(message.clone()),
+                &mut None,
+                &tx,
+            )
+            .await?;
+            assert!(matches!(rx.recv().await, Some(Message::Ack(_))));
+            assert_eq!(*actions.secrets.lock().unwrap(), vec!["482913"]);
+            assert!(
+                core.share_clipboard(crate::outbox::Targets::All("all".into()))
+                    .await
+                    .is_err()
+            );
+            if complete_old_group {
+                queue.push(job.clone());
+                let late = queue.pending.lock().unwrap().automatic.take().unwrap();
+                core.file_actions(&late, false, DesktopAction::Automatic)
+                    .await;
+                assert_eq!(
+                    actions.offers.lock().unwrap().len(),
+                    1,
+                    "late group expansion replaced a code"
+                );
+            }
+
+            // A new unclocked group must reserve above that code, even with phone clock skew.
+            let fresh_queue = ActionQueue::default();
+            job.metadata.transfer_id = Id::from_bytes([92; 16]);
+            begin_received_job(&core, &fresh_queue, &mut job).await;
+            fresh_queue.push(job.clone());
+            let newest = fresh_queue
+                .pending
+                .lock()
+                .unwrap()
+                .automatic
+                .take()
+                .unwrap();
+            core.file_actions(&newest, false, DesktopAction::Automatic)
+                .await;
+            assert_eq!(
+                actions.offers.lock().unwrap().len(),
+                2,
+                "new group lost to an older code"
+            );
+
+            // An older code cannot replace the new group or its next expansion.
+            message.transfer_id = Id::from_bytes([93; 16]);
+            message.text = "OTP 773122".into();
+            core.receive_test(&core.store, &device, Message::Sms(message), &mut None, &tx)
+                .await?;
+            assert!(matches!(rx.recv().await, Some(Message::Ack(_))));
+            assert_eq!(*actions.secrets.lock().unwrap(), vec!["482913"]);
+            job.metadata.transfer_id = Id::from_bytes([94; 16]);
+            begin_received_job(&core, &fresh_queue, &mut job).await;
+            fresh_queue.push(job);
+            let expanded = fresh_queue
+                .pending
+                .lock()
+                .unwrap()
+                .automatic
+                .take()
+                .unwrap();
+            core.file_actions(&expanded, false, DesktopAction::Automatic)
+                .await;
+            assert_eq!(actions.offers.lock().unwrap().len(), 3);
+            assert_eq!(actions.offers.lock().unwrap().last().unwrap().len(), 2);
+            assert!(
+                core.share_clipboard(crate::outbox::Targets::All("all".into()))
+                    .await
+                    .is_err()
+            );
+            assert!(core.automatic.lock().unwrap().selections.is_empty());
+            core.shutdown_actions().await?;
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -6222,7 +6406,7 @@ mod tests {
                 job.file = ReceivedFile::open(&path)?;
                 job.path = path.clone();
                 expected.push(path);
-                begin_received_job(&core.store, &queue, &mut job).await;
+                begin_received_job(&core, &queue, &mut job).await;
                 if index == 1 {
                     // Expire the queue's idle snapshot during this transfer.
                     tokio::time::pause();
@@ -6241,7 +6425,7 @@ mod tests {
             // A mesh image without a sender stamp is saved but never copied.
             job.metadata.hlc = None;
             job.metadata.mime = "image/png".into();
-            begin_received_job(&core.store, &queue, &mut job).await;
+            begin_received_job(&core, &queue, &mut job).await;
             queue.push(job.clone());
             core.file_actions(&job, true, DesktopAction::Automatic)
                 .await;
@@ -6260,7 +6444,7 @@ mod tests {
         job.scope = core.action_scope.lock().unwrap()[&device].clone();
         job.origin.device = device;
         // Track the idle group separately from the installed clipboard offer.
-        begin_received_job(&core.store, &core.action_queue, &mut job).await;
+        begin_received_job(&core, &core.action_queue, &mut job).await;
         core.action_queue.push(job);
         let files = {
             let pending = core.action_queue.pending.lock().unwrap();
@@ -6320,7 +6504,7 @@ mod tests {
                     .into(),
                     ..test_begin(bytes)
                 };
-                begin_received_job(&core.store, &core.action_queue, &mut job).await;
+                begin_received_job(&core, &core.action_queue, &mut job).await;
                 core.action_queue.push(job.clone());
                 if !coalesced && i == 1 {
                     tokio::time::timeout(Duration::from_millis(500), async {
@@ -6447,6 +6631,7 @@ mod tests {
             &state,
             id,
             &Hello {
+                sms_activated: None,
                 role: None,
                 addresses: None,
                 version: 1,
@@ -7913,6 +8098,7 @@ mod tests {
             },
         );
         let current = Hello {
+            sms_activated: None,
             role: None,
             addresses: None,
             version: pneu_proto::PROTOCOL_VERSION,
@@ -7922,6 +8108,7 @@ mod tests {
             paused: Some(false),
         };
         let old = Hello {
+            sms_activated: None,
             name: "Obsolete phone".into(),
             capabilities: vec!["clipboard_text".into()],
             ..current.clone()
@@ -8842,6 +9029,7 @@ mod tests {
             .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
             .await?;
         let hello = Hello {
+            sms_activated: None,
             version: 1,
             device_id: device.clone(),
             name: "Legacy phone".into(),
@@ -11404,7 +11592,7 @@ mod tests {
                     let mut tls = connector.connect(
                         rustls::pki_types::ServerName::try_from("pneu.local")?, stream,
                     ).await?;
-                    write_frame(&mut tls, &Message::Hello(Hello {
+                    write_frame(&mut tls, &Message::Hello(Hello { sms_activated: None,
                         role: Some(DeviceRole::Computer),
                         addresses: Some(vec![format!("127.0.0.1:{}", 10000 + index)]),
                         version: 1,
@@ -13172,6 +13360,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    include!("core_sms_tests.rs");
 }
 
 #[cfg(all(test, windows))]
